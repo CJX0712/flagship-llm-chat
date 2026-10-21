@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>APEX-CHAT · 旗舰可对话迷你 LLM</title>
+<style>
+  :root {
+    --bg: #f6f8fb; --card: #ffffff; --ink: #1a2233; --sub: #5a6678;
+    --line: #e3e8f0; --brand: #2f6df6; --brand2: #14b88a; --warn: #e08a00;
+    --ok: #1f9d57; --bad: #d23b3b;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg); color: var(--ink); line-height: 1.6; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 28px 18px 60px; }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  h1 { font-size: 24px; margin: 0; }
+  .tag { font-size: 12px; color: #fff; background: var(--brand); padding: 3px 9px; border-radius: 20px; }
+  .sub { color: var(--sub); font-size: 13px; margin: 6px 0 18px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px; margin: 14px 0; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .stat { background: #f0f5ff; border: 1px solid #d6e4ff; border-radius: 10px; padding: 12px; }
+  .stat b { display: block; font-size: 20px; color: var(--brand); }
+  .stat span { font-size: 12px; color: var(--sub); }
+  textarea, input { width: 100%; font-size: 14px; padding: 10px 12px; border: 1px solid var(--line);
+    border-radius: 10px; font-family: inherit; background: #fbfcfe; color: var(--ink); }
+  .row { display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
+  button { cursor: pointer; border: none; border-radius: 10px; padding: 10px 16px; font-size: 14px;
+    font-weight: 600; background: var(--brand); color: #fff; }
+  button.ghost { background: #eef2f8; color: var(--ink); }
+  button:disabled { opacity: .5; cursor: default; }
+  #log { margin-top: 14px; max-height: 360px; overflow: auto; }
+  .msg { border-radius: 10px; padding: 10px 12px; margin: 8px 0; font-size: 14px; white-space: pre-wrap; }
+  .you { background: #eef4ff; border: 1px solid #d6e4ff; }
+  .bot { background: #eafaf2; border: 1px solid #cdeede; }
+  .meta { font-size: 11px; color: var(--sub); margin-top: 4px; }
+  .bench { font-size: 13px; }
+  .bench table { width: 100%; border-collapse: collapse; }
+  .bench th, .bench td { border: 1px solid var(--line); padding: 7px 9px; text-align: left; font-size: 13px; }
+  .bench th { background: #f0f5ff; }
+  .warn { color: var(--warn); }
+  code { background: #eef2f8; padding: 1px 6px; border-radius: 5px; font-size: 12px; }
+  footer { color: var(--sub); font-size: 12px; margin-top: 26px; text-align: center; }
+  a { color: var(--brand); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>APEX-CHAT</h1>
+    <span class="tag">可对话迷你 LLM</span>
+    <span class="tag" style="background:var(--brand2)">KV-Cache 推理</span>
+  </header>
+  <div class="sub">站在世界顶级成果之上 · 复用 apex-transformer / apex-engine（注意力 · RoPE · KV-Cache · BM25）· 零依赖</div>
+
+  <div class="card">
+    <div class="grid" id="stats">
+      <div class="stat"><b id="sVocab">–</b><span>词表大小（字符级）</span></div>
+      <div class="stat"><b id="sParams">–</b><span>参数量</span></div>
+      <div class="stat"><b id="sTrain">–</b><span>浏览器内训练步数</span></div>
+      <div class="stat"><b id="sStatus">就绪</b><span>引擎状态</span></div>
+    </div>
+    <div class="row">
+      <button id="trainBtn">在浏览器内训练模型</button>
+      <button id="loadBtn" class="ghost">加载 weights.json</button>
+      <button id="selfBtn" class="ghost">运行自检</button>
+    </div>
+    <div class="meta" id="trainInfo"></div>
+  </div>
+
+  <div class="card">
+    <input id="q" placeholder="问：什么是旗舰？（回车发送）" />
+    <div class="row">
+      <button id="askBtn">发送</button>
+      <label style="font-size:13px;color:var(--sub);align-self:center">
+        <input type="checkbox" id="temp" /> 随机采样（关=贪心）
+      </label>
+      <button id="clearBtn" class="ghost">清空对话</button>
+    </div>
+    <div id="log"></div>
+  </div>
+
+  <div class="card bench">
+    <b>对话链路自检（可交叉验证的不变量）</b>
+    <div id="selftest" class="meta">点击"运行自检"查看权重往返 / 对话连通 / 停止符截断结果</div>
+  </div>
+
+  <div class="card bench">
+    <b>诚实边界（必须一起读的免责）</b>
+    <ul class="warn" style="margin:8px 0 0;padding-left:18px;font-size:13px">
+      <li>搭载<strong>玩具级小模型</strong>（d=32, 2 层），有限训练步内学到的是"问→答"表面<strong>模式记忆/模仿</strong>，<strong>不宣称</strong>真实语义理解或对话能力。</li>
+      <li>多轮对话依赖长度泛化，本系列已实测<strong>长度外推是真实短板</strong>（见 flagship-transformer），长多轮会退化。</li>
+      <li>本页价值在于证明"一个可对话的推理服务链路"在代码上<strong>完整、可复现、可验证</strong>——而非生成质量。</li>
+    </ul>
+  </div>
+
+  <footer>作者：晨星 (GitHub: CJX0712) · 许可：MIT · 系列：flagship-algo-forge / flagship-transformer / flagship-rag-engine / flagship-llm-chat</footer>
+</div>
+
+<script src="./apex-forge.js"></script>
+<script src="./apex-transformer.js"></script>
+<script src="./apex-engine.js"></script>
+<script src="./apex-chat.js"></script>
+<script>
+let CHAT = window.APEX_CHAT, E = window.APEX_E, chat = null, training = false;
+
+function log(kind, who, text, meta) {
+  const el = document.getElementById('log');
+  const d = document.createElement('div');
+  d.className = 'msg ' + (who === '你' ? 'you' : 'bot');
+  d.textContent = (who === '你' ? '你：' : '旗舰：') + text;
+  el.appendChild(d);
+  if (meta) { const m = document.createElement('div'); m.className = 'meta'; m.textContent = meta; el.appendChild(m); }
+  el.scrollTop = el.scrollHeight;
+}
+
+async function ensureModel() {
+  if (chat) return;
+  if (training) return;
+  // 浏览器内即时训练（默认轻量步数，演示用）
+  training = true;
+  document.getElementById('sStatus').textContent = '训练中…';
+  const t0 = Date.now();
+  chat = CHAT.trainChat(CHAT.DEFAULT_CORPUS, { steps: 1500, seed: 20261021 });
+  const ms = (Date.now() - t0) | 0;
+  document.getElementById('sStatus').textContent = '已就绪';
+  document.getElementById('sTrain').textContent = '1500';
+  document.getElementById('sVocab').textContent = chat.tk.size;
+  let nParams = 0; chat.model.params.forEach(p => nParams += p.shape[0] * p.shape[1]);
+  document.getElementById('sParams').textContent = nParams.toLocaleString();
+  document.getElementById('trainInfo').textContent = `浏览器内训练完成 (${ms}ms) · 玩具级演示模型已加载`;
+  training = false;
+}
+
+document.getElementById('trainBtn').onclick = () => ensureModel().then(() => log(null, '旗舰', '模型已就绪，请输入问题。'));
+document.getElementById('loadBtn').onclick = async () => {
+  try {
+    const res = await fetch('./weights.json');
+    if (!res.ok) throw new Error('weights.json 未找到，请先 node train.js 生成');
+    const text = await res.text();
+    chat = CHAT.trainChat(CHAT.DEFAULT_CORPUS, { steps: 1 });
+    CHAT.loadWeights(chat.model, text);
+    document.getElementById('sVocab').textContent = chat.tk.size;
+    let nParams = 0; chat.model.params.forEach(p => nParams += p.shape[0] * p.shape[1]);
+    document.getElementById('sParams').textContent = nParams.toLocaleString();
+    document.getElementById('sStatus').textContent = '已加载权重';
+    log(null, '旗舰', '已加载 weights.json 权重。');
+  } catch (e) { alert(e.message); }
+};
+document.getElementById('selfBtn').onclick = () => {
+  const r = CHAT.runSelfTest();
+  const box = document.getElementById('selftest');
+  box.innerHTML = r.map(x => `<div>${x.pass ? '✅' : '❌'} ${x.name} — ${x.detail}</div>`).join('');
+};
+
+async function ask() {
+  const q = document.getElementById('q').value.trim();
+  if (!q) return;
+  await ensureModel();
+  log(null, '你', q);
+  document.getElementById('q').value = '';
+  const t0 = Date.now();
+  const r = CHAT.respond(chat, q, { maxTokens: 18, greedy: !document.getElementById('temp').checked });
+  const ms = (Date.now() - t0) | 0;
+  log(null, '旗舰', r.text || '（空）', `${r.tokens.length} token · ${ms}ms · KV-Cache 解码`);
+}
+document.getElementById('askBtn').onclick = ask;
+document.getElementById('q').addEventListener('keydown', e => { if (e.key === 'Enter') ask(); });
+document.getElementById('clearBtn').onclick = () => { document.getElementById('log').innerHTML = ''; };
+</script>
+</body>
+</html>
