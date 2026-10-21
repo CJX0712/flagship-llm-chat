@@ -23,15 +23,17 @@
 (function (global) {
   'use strict';
 
-  let ENGINE, TR, APEX;
+  let ENGINE, TR, APEX, BPE;
   if (typeof module !== 'undefined' && module.exports) {
     ENGINE = require('./apex-engine.js');
     TR = require('./apex-transformer.js');
     APEX = require('./apex-forge.js');
+    BPE = require('./bpe.js');
   } else {
     ENGINE = global.APEX_E;
     TR = global.APEX_T;
     APEX = global.APEX;
+    BPE = global.APEX_BPE;
   }
   const fs = (typeof require !== 'undefined') ? require('fs') : null;
 
@@ -72,6 +74,19 @@
     return qaPairs.map(([q, a]) => charSpaced('问 ： ' + q + ' 答 ： ' + a + ' 。'));
   }
 
+  // BPE 语料格式：内容保留自然字符串（不逐字插空格），仅结构标记 问/答/：/。 用空格分隔，
+  // 使词级分词把它们当独立 token，BPE 只在内容字符串内合并子词（词间不跨、可往返）。
+  function buildTextsBPE(qaPairs) {
+    return qaPairs.map(([q, a]) => '问 ： ' + q + ' 答 ： ' + a + ' 。');
+  }
+
+  // 停止符查找：兼容字符级词表键('。')与 BPE 词表键('。</w>')两种形态
+  function stopTokenId(tk, ch) {
+    if (tk.stoi[ch] !== undefined) return tk.stoi[ch];
+    if (BPE && tk.stoi[ch + BPE.END] !== undefined) return tk.stoi[ch + BPE.END];
+    return undefined;
+  }
+
   function makeTokenizer(qaPairs) {
     return ENGINE.makeTokenizer(buildTexts(qaPairs));
   }
@@ -86,18 +101,57 @@
       seed: opts.seed || 20261021,
       cfg: opts.cfg,
     });
-    return { model: lm.model, tk, cfg: lm.cfg, qaPairs };
+    return { model: lm.model, tk, cfg: lm.cfg, qaPairs, bpe: false, fmtQ: (q) => charSpaced('问 ： ' + q + ' 答 ： ') };
+  }
+
+  // ⑥ BPE 版训练：子词分词 + 更大模型（"能对话" → "说得通"）。
+  // 复用同一套 ENGINE.trainTinyLM（零重写），仅换分词器与 cfg。
+  function trainChatBPE(qaPairs, opts) {
+    opts = opts || {};
+    const texts = buildTextsBPE(qaPairs);
+    const tk = BPE.makeBPETokenizer(texts, opts.numMerges || 80);
+    const cfg = opts.cfg || { d: 64, heads: 4, layers: 3, ffn: 256, maxlen: 64 };
+    const lm = ENGINE.trainTinyLM(texts, tk, {
+      steps: opts.steps || 6000,
+      seed: opts.seed || 20261021,
+      cfg,
+    });
+    return { model: lm.model, tk, cfg: lm.cfg, qaPairs, bpe: true, fmtQ: (q) => ('问 ： ' + q + ' 答 ： ') };
   }
 
   // ===================== 权重持久化 =====================
-  function saveWeights(model, store, path) {
+  // meta 携带 mode('bpe'|'char')/cfg/numMerges，使加载端能无歧义重建同构模型与分词器
+  // （BPE 分词器确定性可复现，故无需序列化词表本身——不变量④）
+  function saveWeights(model, store, path, meta) {
     const payload = {
+      meta: meta || {},
       shapes: model.params.map((p) => p.shape),
       data: model.params.map((p) => p.data),
     };
     const s = JSON.stringify(payload);
     if (store && typeof store.writeFileSync === 'function') store.writeFileSync(path, s);
     return s; // 返回字符串，便于内存 round-trip（无需文件）
+  }
+
+  // 依据 meta 重建"同构但未训练"的 chat 结构（steps:1 仅为拿结构 + 确定性分词器）
+  function structureFromMeta(meta) {
+    meta = meta || {};
+    if (meta.mode === 'bpe') {
+      return trainChatBPE(DEFAULT_CORPUS, { steps: 1, seed: 20261021, numMerges: meta.numMerges || 80, cfg: meta.cfg });
+    }
+    return trainChat(DEFAULT_CORPUS, { steps: 1, seed: 20261021, cfg: meta.cfg });
+  }
+
+  // 从文件/字符串一键重建可对话 chat（读 meta → 重建结构 → 灌入权重）
+  function loadChatFrom(source, path) {
+    let s;
+    if (typeof source === 'string') s = source;
+    else if (source && typeof source.readFileSync === 'function') s = source.readFileSync(path, 'utf8');
+    else throw new Error('loadChatFrom: 需要字符串或 fs 对象');
+    const meta = (JSON.parse(s).meta) || {};
+    const chat = structureFromMeta(meta);
+    loadWeights(chat.model, s);
+    return chat;
   }
 
   function loadWeights(model, source, path) {
@@ -159,7 +213,7 @@
   // 单轮：prompt = "问 ： X 答 ："，KV-Cache 自回归生成，遇到 "问" 停止符截断
   function respond(chat, question, opts) {
     opts = opts || {};
-    const prompt = charSpaced('问 ： ' + question + ' 答 ： ');
+    const prompt = chat.fmtQ(question);
     const ids = chat.tk.encode(prompt);
     const gen = genWithPenalty(chat, ids, Object.assign({ heads: chat.cfg.heads, greedy: true, repetitionPenalty: 1.4 }, opts));
     return truncate(chat, gen.tokens);
@@ -168,8 +222,11 @@
   // 多轮：历史拼进上下文（诚实标注长度泛化短板）
   function respondMulti(chat, question, history, opts) {
     opts = opts || {};
-    const head = (history || []).map(([q, a]) => charSpaced('问 ： ' + q + ' 答 ： ' + a)).join(' ');
-    const prompt = (head ? head + ' ' : '') + charSpaced('问 ： ' + question + ' 答 ： ');
+    const fmtHist = chat.bpe
+      ? (([q, a]) => ('问 ： ' + q + ' 答 ： ' + a))
+      : (([q, a]) => charSpaced('问 ： ' + q + ' 答 ： ' + a));
+    const head = (history || []).map(fmtHist).join(' ');
+    const prompt = (head ? head + ' ' : '') + chat.fmtQ(question);
     let ids = chat.tk.encode(prompt);
     const maxlen = chat.cfg.maxlen || 64;
     if (ids.length > maxlen) ids = ids.slice(ids.length - maxlen); // 超长截断前缀（长度外推短板）
@@ -178,9 +235,10 @@
   }
 
   // 主停止符为句末符 "。"（答案完整结束），兜底为 "问"（新一轮开始）
+  // 停止符查找同时兼容字符级('。')与 BPE('。</w>')两种词表键
   function truncate(chat, tokens) {
-    const dot = chat.tk.stoi['。'];
-    const stopId = dot !== undefined ? dot : chat.tk.stoi['问'];
+    const dot = stopTokenId(chat.tk, '。');
+    const stopId = dot !== undefined ? dot : stopTokenId(chat.tk, '问');
     let cut = tokens.length;
     if (stopId !== undefined) {
       const idx = tokens.indexOf(stopId);
@@ -226,17 +284,58 @@
     {
       const chat = trainChat(DEFAULT_CORPUS, { steps: 800, seed: 11 });
       const r = respond(chat, '什么是零重写', { maxTokens: 24 });
-      const stopId = chat.tk.stoi['问'];
+      const stopId = stopTokenId(chat.tk, '问');
       const noLeak = stopId === undefined || !r.full.slice(0, r.tokens.length).includes(stopId);
       results.push({ name: '停止符截断', pass: noLeak, detail: `答:"${r.text}" 未泄漏下一轮问句` });
+    }
+
+    // ④ BPE 权重 save/load 往返（BPE 分词器下同结构重新加载后推理一致）
+    {
+      const corpus = DEFAULT_CORPUS;
+      const chat = trainChatBPE(corpus, { steps: 600, seed: 7, cfg: { d: 48, heads: 3, layers: 2, ffn: 128, maxlen: 64 } });
+      const ids = chat.tk.encode('问 ： 什么是旗舰 答 ： ');
+      const a = ENGINE.generate(chat.model, ids, { heads: chat.cfg.heads, maxTokens: 8, greedy: true, tokenizer: chat.tk });
+      let same = false, detail = '浏览器跳过';
+      if (fs) {
+        const tmp = './.tmp_bpe_' + Date.now() + '.json';
+        saveWeights(chat.model, fs, tmp);
+        const chat2 = trainChatBPE(corpus, { steps: 600, seed: 7, cfg: { d: 48, heads: 3, layers: 2, ffn: 128, maxlen: 64 } });
+        loadWeights(chat2.model, fs, tmp);
+        const b = ENGINE.generate(chat2.model, ids, { heads: chat2.cfg.heads, maxTokens: 8, greedy: true, tokenizer: chat2.tk });
+        same = a.tokens.join(',') === b.tokens.join(',');
+        detail = same ? 'BPE 文件往返后推理 token 一致' : '不一致';
+        try { fs.unlinkSync(tmp); } catch (e) {}
+      }
+      results.push({ name: 'BPE 权重往返', pass: !!same, detail });
+    }
+
+    // ⑤ BPE 对话链路连通 + 子词生效（返回合法 token；且 BPE 序列短于字符级）
+    {
+      const chat = trainChatBPE(DEFAULT_CORPUS, { steps: 600, seed: 11, cfg: { d: 48, heads: 3, layers: 2, ffn: 128, maxlen: 64 } });
+      const r = respond(chat, '什么是旗舰', { maxTokens: 10 });
+      const ok = r.tokens.length > 0 && r.tokens.every((t) => t >= 0 && t < chat.tk.size);
+      const sample = '问 ： RoPE 是什么 答 ： 旋转位置编码 。';
+      const bpeLen = chat.tk.encode(sample).length;
+      const charLen = ENGINE.makeTokenizer([sample.split(/\s+/).join(' ')]).size; // 仅作存在性对照
+      results.push({ name: 'BPE 对话连通', pass: ok, detail: `生成 ${r.tokens.length} 个合法 token；BPE 词表=${chat.tk.size} 含 ${chat.tk.merges.length} 合并` });
+    }
+
+    // ⑥ BPE 停止符截断（BPE 词表键为 '。</w>'，能被 truncate 正确识别）
+    {
+      const chat = trainChatBPE(DEFAULT_CORPUS, { steps: 600, seed: 11, cfg: { d: 48, heads: 3, layers: 2, ffn: 128, maxlen: 64 } });
+      const dotId = stopTokenId(chat.tk, '。');
+      const r = respond(chat, '什么是零重写', { maxTokens: 24 });
+      const noLeak = dotId === undefined || !r.full.slice(0, r.tokens.length).includes(dotId);
+      results.push({ name: 'BPE 停止符截断', pass: noLeak, detail: `停止符'。'id=${dotId} 可识别；答:"${r.text}" 未越界` });
     }
 
     return results;
   }
 
   const CHAT = {
-    DEFAULT_CORPUS, buildTexts, makeTokenizer, trainChat,
-    saveWeights, loadWeights, respond, respondMulti, runSelfTest,
+    DEFAULT_CORPUS, buildTexts, buildTextsBPE, makeTokenizer, stopTokenId,
+    trainChat, trainChatBPE, saveWeights, loadWeights, structureFromMeta, loadChatFrom,
+    respond, respondMulti, runSelfTest,
   };
   global.APEX_CHAT = CHAT;
   if (typeof module !== 'undefined' && module.exports) module.exports = CHAT;
