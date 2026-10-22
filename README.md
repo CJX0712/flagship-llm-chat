@@ -1,5 +1,8 @@
 # APEX-CHAT · 旗舰可对话迷你 LLM 服务层
 
+> **从零造 AI，并造尺子证明它没骗你** · 一套开源的"AI 验伪"方法与实物
+> 舰队总览：[apex-flagship](https://github.com/CJX0712/apex-flagship) · 作者：晨星
+
 把[旗舰 Transformer](https://github.com/CJX0712/flagship-transformer) 与[旗舰推理引擎](https://github.com/CJX0712/flagship-rag-engine) 变成**一个真能对话的迷你 LLM 服务**——而不是只跑通一条演示流水线。
 
 这是旗舰 AI 锻造闭环的**第四件实物**。
